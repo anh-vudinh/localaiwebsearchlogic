@@ -33,25 +33,60 @@ interface RejectedSource {
   reason: string;
 }
 
-// Research pipeline settings.
+type TimeRange = "day" | "week" | "month" | "year";
+
 const PAGE_WAIT_MS = 4000;
 const RESEARCH_CANDIDATES = 15;
 const DEFAULT_RESEARCH_SOURCES = 5;
 
-/**
- * Pause before inspecting a successfully fetched page.
- *
- * This gives transient security/challenge pages a few seconds
- * to render before we decide whether the page is usable.
- */
+// Keep the total research context relatively small while giving
+// each accepted source enough room to be useful.
+const RESEARCH_CONTENT_LIMITS = [
+  2600,
+  2400,
+  2200,
+  2000,
+  1800,
+];
+
+const MIN_PAGE_WORDS = 150;
+const MAX_CHALLENGE_INSPECTION_CHARS = 100000;
+
+const TIME_RANGES: TimeRange[] = [
+  "day",
+  "week",
+  "month",
+  "year",
+];
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeTimeRange(
+  value?: string
+): TimeRange | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const normalized = value
+    .toLowerCase()
+    .trim();
+
+  return TIME_RANGES.includes(
+    normalized as TimeRange
+  )
+    ? (normalized as TimeRange)
+    : undefined;
 }
 
 /**
  * Normalize text for challenge detection.
  */
-function normalizeForDetection(text: string): string {
+function normalizeForDetection(
+  text: string
+): string {
   return text
     .toLowerCase()
     .replace(/\s+/g, " ")
@@ -61,30 +96,19 @@ function normalizeForDetection(text: string): string {
 /**
  * Detect an ACTIVE human-verification page.
  *
- * Important:
- *
- * We do NOT reject a page simply because it mentions:
- *
- *   Cloudflare
- *   bot
- *   bot detection
- *   security
- *   CAPTCHA
- *   verification
- *
- * Those words can naturally occur in legitimate articles.
- *
- * We are looking for language that indicates the PAGE IS CURRENTLY
- * ASKING THE VISITOR TO COMPLETE A HUMAN/BOT VERIFICATION.
+ * We intentionally do not reject a page merely because it mentions
+ * Cloudflare, CAPTCHA, bots, verification, etc. Those terms can
+ * legitimately occur inside articles.
  */
-function detectActiveChallenge(text: string): string | null {
-  const normalized = normalizeForDetection(text);
+function detectActiveChallenge(
+  text: string
+): string | null {
+  const normalized =
+    normalizeForDetection(text);
 
-  // ---------------------------------------------------------------
-  // Explicit active verification instructions.
-  // ---------------------------------------------------------------
-
-  const challengePatterns: Array<[RegExp, string]> = [
+  const challengePatterns: Array<
+    [RegExp, string]
+  > = [
     [
       /verify (?:you'?re|you are) human/,
       "active human verification",
@@ -191,215 +215,1004 @@ function detectActiveChallenge(text: string): string | null {
     ],
   ];
 
-  for (const [pattern, reason] of challengePatterns) {
+  for (const [
+    pattern,
+    reason,
+  ] of challengePatterns) {
     if (pattern.test(normalized)) {
       return reason;
     }
   }
 
-  // ---------------------------------------------------------------
-  // CAPTCHA systems.
-  //
-  // A page saying "this article discusses CAPTCHA" should not be
-  // rejected. We therefore require active/instructional context.
-  // ---------------------------------------------------------------
+  const wordCount = normalized
+    .split(/\s+/)
+    .filter(Boolean)
+    .length;
 
-const wordCount = normalized
-  .split(/\s+/)
-  .filter(Boolean)
-  .length;
+  const explicitChallengeInstruction =
+    /\bverify\s+(?:that\s+)?(?:you(?:'re| are)|yourself)\s+(?:are\s+)?human\b/i.test(
+      normalized
+    ) ||
+    /\bi\s*(?:am|'m)\s+not\s+a\s+robot\b/i.test(
+      normalized
+    ) ||
+    /\b(?:select|choose)\s+all\s+(?:the\s+)?(?:images|squares|tiles)\b/i.test(
+      normalized
+    ) ||
+    /\b(?:move|drag)\s+(?:the\s+)?(?:slider|puzzle\s+piece)\b/i.test(
+      normalized
+    ) ||
+    /\b(?:press|click)\s+and\s+hold\s+(?:to\s+)?verify\b/i.test(
+      normalized
+    ) ||
+    /\bcomplete\s+(?:the\s+)?(?:captcha|challenge|verification)\b/i.test(
+      normalized
+    );
 
-const explicitChallengeInstruction =
-  /\bverify\s+(?:that\s+)?(?:you(?:'re| are)|yourself)\s+(?:are\s+)?human\b/i.test(normalized) ||
-  /\bi\s*(?:am|'m)\s+not\s+a\s+robot\b/i.test(normalized) ||
-  /\b(?:select|choose)\s+all\s+(?:the\s+)?(?:images|squares|tiles)\b/i.test(normalized) ||
-  /\b(?:move|drag)\s+(?:the\s+)?(?:slider|puzzle\s+piece)\b/i.test(normalized) ||
-  /\b(?:press|click)\s+and\s+hold\s+(?:to\s+)?verify\b/i.test(normalized) ||
-  /\bcomplete\s+(?:the\s+)?(?:captcha|challenge|verification)\b/i.test(normalized);
+  const hasCaptcha =
+    /\b(?:captcha|recaptcha|hcaptcha)\b/i.test(
+      normalized
+    );
 
-const hasCaptcha =
-  /\b(?:captcha|recaptcha|hcaptcha)\b/i.test(normalized);
+  const hasTurnstile =
+    /\bturnstile\b/i.test(normalized);
 
-const hasTurnstile =
-  /\bturnstile\b/i.test(normalized);
+  const hasChallengeContext =
+    /\b(?:challenge|verification|verify|human|robot)\b/i.test(
+      normalized
+    );
 
-const hasChallengeContext =
-  /\b(?:challenge|verification|verify|human|robot)\b/i.test(normalized);
+  if (explicitChallengeInstruction) {
+    return "active verification challenge detected";
+  }
 
-if (explicitChallengeInstruction) {
-  return "active verification challenge detected";
-}
-
-if (
-  wordCount < 150 &&
-  (
-    (hasCaptcha && hasChallengeContext) ||
-    (hasTurnstile && hasChallengeContext)
-  )
-) {
-  return "active verification challenge detected";
-}
+  if (
+    wordCount < 150 &&
+    (
+      (hasCaptcha &&
+        hasChallengeContext) ||
+      (hasTurnstile &&
+        hasChallengeContext)
+    )
+  ) {
+    return "active verification challenge detected";
+  }
 
   return null;
 }
+
+/**
+ * Normalize a title for duplicate-article comparison.
+ */
+function normalizeTitle(
+  title: string
+): string {
+  return title
+    .toLowerCase()
+    .replace(
+      /https?:\/\/\S+/g,
+      " "
+    )
+    .replace(
+      /[^\p{L}\p{N}\s]/gu,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Create a lightweight title fingerprint.
+ *
+ * This intentionally avoids aggressive fuzzy matching. The goal is
+ * only to prevent obvious duplicate/syndicated articles from being
+ * selected repeatedly.
+ */
+function getTitleTerms(
+  title: string
+): Set<string> {
+  const stopWords = new Set(
+    stopwords()
+  );
+
+  return new Set(
+    normalizeTitle(title)
+      .split(/\s+/)
+      .filter(
+        (term) =>
+          term.length >= 3 &&
+          !stopWords.has(term)
+      )
+  );
+}
+
+function titleSimilarity(
+  first: string,
+  second: string
+): number {
+  const firstTerms =
+    getTitleTerms(first);
+
+  const secondTerms =
+    getTitleTerms(second);
+
+  if (
+    firstTerms.size === 0 ||
+    secondTerms.size === 0
+  ) {
+    return 0;
+  }
+
+  let intersection = 0;
+
+  for (const term of firstTerms) {
+    if (secondTerms.has(term)) {
+      intersection++;
+    }
+  }
+
+  const union =
+    new Set([
+      ...firstTerms,
+      ...secondTerms,
+    ]).size;
+
+  return union === 0
+    ? 0
+    : intersection / union;
+}
+
+/**
+ * Detect obvious duplicate articles.
+ *
+ * We deliberately do NOT reject merely because two articles share
+ * the same domain. Different articles from the same website are fine.
+ */
+function isDuplicateArticle(
+  candidate: SearXNGResult,
+  accepted: AcceptedSource[]
+): boolean {
+  const normalizedCandidateUrl =
+    normalizeUrl(candidate.url);
+
+  for (const source of accepted) {
+    if (
+      normalizeUrl(source.url) ===
+      normalizedCandidateUrl
+    ) {
+      return true;
+    }
+
+    const similarity =
+      titleSimilarity(
+        candidate.title,
+        source.title
+      );
+
+    if (similarity >= 0.82) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function normalizeUrl(
+  value: string
+): string {
+  try {
+    const url = new URL(value);
+
+    url.hash = "";
+
+    // Remove common tracking parameters.
+    const trackingPrefixes = [
+      "utm_",
+      "fbclid",
+      "gclid",
+      "mc_cid",
+      "mc_eid",
+    ];
+
+    for (const key of [
+      ...url.searchParams.keys(),
+    ]) {
+      if (
+        trackingPrefixes.some(
+          (prefix) =>
+            key === prefix ||
+            key.startsWith(prefix)
+        )
+      ) {
+        url.searchParams.delete(key);
+      }
+    }
+
+    return url.toString();
+  } catch {
+    return value
+      .trim()
+      .toLowerCase();
+  }
+}
+
+/**
+ * Select the most relevant portions of a page.
+ *
+ * Ranking:
+ *
+ *  - exact query phrase
+ *  - query terms appearing in a paragraph
+ *  - repeated terms, with diminishing returns
+ *  - headings receive an additional relevance bonus
+ *  - neighboring paragraphs are retained for context
+ */
 
 function selectRelevantContent(
   content: string,
   query: string,
   maxLength = 6000
 ): string {
-  if (content.length <= maxLength) {
-    return content;
+  if (!content.trim()) {
+    return "";
   }
 
-	const stopWords = new Set(stopwords());
+  if (content.length <= maxLength) {
+    return content.trim();
+  }
 
-  const terms = query
+  const stopWords = new Set(stopwords());
+
+  const normalizedQuery = query
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s.-]/gu, " ")
-    .split(/\s+/)
-    .filter(
-      (term) =>
-        term.length >= 3 &&
-        !stopWords.has(term)
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalizedQuery) {
+    return (
+      content.substring(0, maxLength).trim() +
+      "\n...[source truncated]"
     );
-	
-	const queryPhrase = query
-	  .toLowerCase()
-	  .replace(/[^\p{L}\p{N}\s.-]/gu, " ")
-	  .replace(/\s+/g, " ")
-	  .trim();
+  }
+
+  // ---------------------------------------------------------------
+  // 1. Extract meaningful query terms.
+  // ---------------------------------------------------------------
+
+  const terms = [
+    ...new Set(
+      normalizedQuery
+        .split(/\s+/)
+        .filter(
+          (term) =>
+            term.length >= 3 &&
+            !stopWords.has(term)
+        )
+    ),
+  ];
 
   if (terms.length === 0) {
-    return content.substring(0, maxLength).trim() +
-      "\n...[source truncated]";
+    return (
+      content.substring(0, maxLength).trim() +
+      "\n...[source truncated]"
+    );
   }
 
-  const paragraphs = content
-    .split(/\n\s*\n/)
-    .map((text) => text.trim())
-    .filter(Boolean);
-
-  const scored = paragraphs.map((paragraph, index) => {
-    const lower = paragraph.toLowerCase();
-
-    let score = 0;
-
-	if (
-	  queryPhrase.length >= 4 &&
-	  lower.includes(queryPhrase)
-	) {
-	  score += 5;
-	}
-
-    for (const term of terms) {
-      const matches = lower.split(term).length - 1;
-      score += Math.min(matches, 3);
-    }
-
-    return {
-      index,
-      paragraph,
-      score,
-    };
-  });
-
-  const relevant = scored
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score);
-
-  if (relevant.length === 0) {
-    return content.substring(0, maxLength).trim() +
-      "\n...[source truncated]";
-  }
-
-  const selected = new Set<number>();
-
-  let totalLength = 0;
-
-  for (const item of relevant) {
-    // Include neighboring paragraphs so context isn't fragmented.
-    const start = Math.max(0, item.index - 1);
-    const end = Math.min(
-      paragraphs.length - 1,
-      item.index + 1
+  const escapeRegex = (
+    value: string
+  ) =>
+    value.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&"
     );
 
-    for (let i = start; i <= end; i++) {
-      if (selected.has(i)) continue;
+  // ---------------------------------------------------------------
+  // 2. Find every keyword occurrence.
+  // ---------------------------------------------------------------
 
-      const addition =
-        paragraphs[i] + "\n\n";
+  interface Match {
+    start: number;
+    end: number;
+    term: string;
+    score: number;
+  }
+
+  const matches: Match[] = [];
+
+  for (const term of terms) {
+    const regex = new RegExp(
+      `\\b${escapeRegex(term)}\\b`,
+      "giu"
+    );
+
+    let match: RegExpExecArray | null;
+
+    while (
+      (match = regex.exec(content)) !== null
+    ) {
+      matches.push({
+        start: match.index,
+        end:
+          match.index +
+          match[0].length,
+        term,
+        score: 0,
+      });
 
       if (
-        totalLength + addition.length >
-        maxLength
+        match.index ===
+        regex.lastIndex
+      ) {
+        regex.lastIndex++;
+      }
+    }
+  }
+
+  if (matches.length === 0) {
+    return (
+      content.substring(0, maxLength).trim() +
+      "\n...[source truncated]"
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // 3. Score each occurrence.
+  //
+  // Strong signals:
+  //   - exact query phrase nearby
+  //   - multiple query terms nearby
+  //   - multiple matches clustered together
+  //   - longer/more specific terms
+  // ---------------------------------------------------------------
+
+  const exactPhrase =
+    normalizedQuery.length >= 4
+      ? normalizedQuery
+      : "";
+
+  for (const match of matches) {
+    let score = 1;
+
+    // Longer terms are generally more informative.
+    score += Math.min(
+      match.term.length / 3,
+      4
+    );
+
+    const localStart =
+      Math.max(
+        0,
+        match.start - 300
+      );
+
+    const localEnd =
+      Math.min(
+        content.length,
+        match.end + 300
+      );
+
+    const localContext =
+      content
+        .substring(
+          localStart,
+          localEnd
+        )
+        .toLowerCase();
+
+    // Exact complete-query phrase.
+    if (
+      exactPhrase &&
+      localContext.includes(
+        exactPhrase
+      )
+    ) {
+      score += 15;
+    }
+
+    // Other query terms nearby.
+    for (const term of terms) {
+      if (
+        term === match.term
       ) {
         continue;
       }
 
-      selected.add(i);
-      totalLength += addition.length;
+      const regex =
+        new RegExp(
+          `\\b${escapeRegex(term)}\\b`,
+          "iu"
+        );
+
+      if (
+        regex.test(localContext)
+      ) {
+        score += 5;
+      }
     }
 
-    if (totalLength >= maxLength * 0.95) {
+    // Very close keyword clustering.
+    for (const other of matches) {
+      if (
+        other === match
+      ) {
+        continue;
+      }
+
+      const distance =
+        Math.abs(
+          other.start -
+            match.start
+        );
+
+      if (distance <= 75) {
+        score += 4;
+      } else if (
+        distance <= 150
+      ) {
+        score += 2;
+      } else if (
+        distance <= 300
+      ) {
+        score += 1;
+      }
+    }
+
+    match.score = score;
+  }
+
+  // ---------------------------------------------------------------
+  // 4. Convert matches into relevance regions.
+  //
+  // The initial region is deliberately small. We will expand it
+  // later, which lets the relevance score determine WHERE to spend
+  // the context budget.
+  // ---------------------------------------------------------------
+
+  interface Region {
+    start: number;
+    end: number;
+    score: number;
+  }
+
+  const INITIAL_CONTEXT = 300;
+
+  const regions: Region[] =
+    matches.map(
+      (match) => ({
+        start: Math.max(
+          0,
+          match.start -
+            INITIAL_CONTEXT
+        ),
+        end: Math.min(
+          content.length,
+          match.end +
+            INITIAL_CONTEXT
+        ),
+        score:
+          match.score,
+      })
+    );
+
+  // ---------------------------------------------------------------
+  // 5. Merge overlapping regions.
+  // ---------------------------------------------------------------
+
+  regions.sort(
+    (a, b) =>
+      a.start - b.start
+  );
+
+  const mergedRegions: Region[] =
+    [];
+
+  for (const region of regions) {
+    const previous =
+      mergedRegions[
+        mergedRegions.length - 1
+      ];
+
+    if (
+      previous &&
+      region.start <=
+        previous.end
+    ) {
+      previous.end =
+        Math.max(
+          previous.end,
+          region.end
+        );
+
+      previous.score =
+        Math.max(
+          previous.score,
+          region.score
+        );
+    } else {
+      mergedRegions.push({
+        ...region,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // 6. Re-score merged regions based on keyword density.
+  //
+  // A region containing many different query terms is much more
+  // useful than a region containing one keyword repeatedly.
+  // ---------------------------------------------------------------
+
+  for (const region of mergedRegions) {
+    const regionText =
+      content
+        .substring(
+          region.start,
+          region.end
+        )
+        .toLowerCase();
+
+    const uniqueTerms =
+      terms.filter((term) => {
+        const regex =
+          new RegExp(
+            `\\b${escapeRegex(term)}\\b`,
+            "iu"
+          );
+
+        return regex.test(
+          regionText
+        );
+      }).length;
+
+    region.score +=
+      uniqueTerms * 6;
+  }
+
+  // ---------------------------------------------------------------
+  // 7. Rank the strongest regions.
+  // ---------------------------------------------------------------
+
+  const rankedRegions =
+    mergedRegions
+      .map(
+        (region, index) => ({
+          ...region,
+          id: index,
+        })
+      )
+      .sort(
+        (a, b) =>
+          b.score - a.score
+      );
+
+  // ---------------------------------------------------------------
+  // 8. Start with the strongest regions.
+  //
+  // We don't immediately consume the entire region. Instead, we
+  // create selected regions and then expand them outward.
+  // ---------------------------------------------------------------
+
+  interface SelectedRegion {
+    id: number;
+    start: number;
+    end: number;
+    score: number;
+  }
+
+  const selected: SelectedRegion[] =
+    [];
+
+  let usedCharacters = 0;
+
+  for (const region of rankedRegions) {
+    if (
+      selected.length >= 8
+    ) {
+      break;
+    }
+
+    const length =
+      region.end -
+      region.start;
+
+    if (
+      length <= 0
+    ) {
+      continue;
+    }
+
+    if (
+      usedCharacters +
+        length <=
+      maxLength
+    ) {
+      selected.push({
+        id: region.id,
+        start: region.start,
+        end: region.end,
+        score: region.score,
+      });
+
+      usedCharacters +=
+        length;
+    }
+  }
+
+  if (selected.length === 0) {
+    return (
+      content.substring(0, maxLength).trim() +
+      "\n...[source truncated]"
+    );
+  }
+
+  // ---------------------------------------------------------------
+  // 9. Merge selected regions if they overlap.
+  // ---------------------------------------------------------------
+
+  function mergeSelectedRegions() {
+    selected.sort(
+      (a, b) =>
+        a.start - b.start
+    );
+
+    for (
+      let i = 0;
+      i <
+        selected.length - 1;
+
+    ) {
+      const current =
+        selected[i];
+
+      const next =
+        selected[i + 1];
+
+      if (
+        current.end >=
+        next.start
+      ) {
+        current.end =
+          Math.max(
+            current.end,
+            next.end
+          );
+
+        current.score =
+          Math.max(
+            current.score,
+            next.score
+          );
+
+        selected.splice(
+          i + 1,
+          1
+        );
+      } else {
+        i++;
+      }
+    }
+  }
+
+  mergeSelectedRegions();
+
+  usedCharacters =
+    selected.reduce(
+      (total, region) =>
+        total +
+        (region.end -
+          region.start),
+      0
+    );
+
+  // ---------------------------------------------------------------
+  // 10. EXPAND the selected regions.
+  //
+  // This is the important part.
+  //
+  // Rather than selecting fixed-size chunks, grow the relevant
+  // regions outward until the character budget is saturated.
+  //
+  // We alternate left/right expansion so we don't accidentally
+  // spend the entire remaining budget on one side.
+  // ---------------------------------------------------------------
+
+  const EXPANSION_STEP = 500;
+
+  while (
+    usedCharacters <
+      maxLength &&
+    selected.length > 0
+  ) {
+    let expanded = false;
+
+    /*
+     * Prioritize higher-scoring regions when deciding where to
+     * spend additional context.
+     */
+    selected.sort(
+      (a, b) =>
+        b.score - a.score
+    );
+
+    for (const region of selected) {
+      if (
+        usedCharacters >=
+        maxLength
+      ) {
+        break;
+      }
+
+      const remaining =
+        maxLength -
+        usedCharacters;
+
+      const leftAvailable =
+        region.start;
+
+      const rightAvailable =
+        content.length -
+        region.end;
+
+      if (
+        leftAvailable <= 0 &&
+        rightAvailable <= 0
+      ) {
+        continue;
+      }
+
+      /*
+       * Expand on both sides where possible.
+       */
+      const desired =
+        Math.min(
+          EXPANSION_STEP,
+          remaining
+        );
+
+      let leftExpansion =
+        Math.min(
+          Math.floor(
+            desired / 2
+          ),
+          leftAvailable
+        );
+
+      let rightExpansion =
+        Math.min(
+          desired -
+            leftExpansion,
+          rightAvailable
+        );
+
+      /*
+       * If one side ran out, give the unused budget to the other
+       * side.
+       */
+      if (
+        leftExpansion <
+        Math.floor(
+          desired / 2
+        )
+      ) {
+        rightExpansion =
+          Math.min(
+            desired -
+              leftExpansion,
+            rightAvailable
+          );
+      }
+
+      if (
+        rightExpansion <
+        desired -
+          Math.floor(
+            desired / 2
+          )
+      ) {
+        leftExpansion =
+          Math.min(
+            desired -
+              rightExpansion,
+            leftAvailable
+          );
+      }
+
+      if (
+        leftExpansion === 0 &&
+        rightExpansion === 0
+      ) {
+        continue;
+      }
+
+      region.start -=
+        leftExpansion;
+
+      region.end +=
+        rightExpansion;
+
+      usedCharacters +=
+        leftExpansion +
+        rightExpansion;
+
+      expanded = true;
+
+      /*
+       * If this expansion caused two regions to touch or overlap,
+       * merge them before continuing.
+       */
+      mergeSelectedRegions();
+    }
+
+    if (!expanded) {
       break;
     }
   }
 
-  const result = Array.from(selected)
-    .sort((a, b) => a - b)
-    .map((index) => paragraphs[index])
-    .join("\n\n");
+  // ---------------------------------------------------------------
+  // 11. If there is still unused budget, use the remaining space
+  //     around the highest-value region.
+  // ---------------------------------------------------------------
 
-  return result.trim() +
-    (result.length < content.length
-      ? "\n...[source truncated]"
-      : "");
+  if (
+    usedCharacters <
+    maxLength
+  ) {
+    selected.sort(
+      (a, b) =>
+        b.score - a.score
+    );
+
+    const primary =
+      selected[0];
+
+    if (primary) {
+      const remaining =
+        maxLength -
+        usedCharacters;
+
+      const leftAvailable =
+        primary.start;
+
+      const rightAvailable =
+        content.length -
+        primary.end;
+
+      const left =
+        Math.min(
+          Math.floor(
+            remaining / 2
+          ),
+          leftAvailable
+        );
+
+      const right =
+        Math.min(
+          remaining - left,
+          rightAvailable
+        );
+
+      primary.start -=
+        left;
+
+      primary.end +=
+        right;
+
+      usedCharacters +=
+        left + right;
+
+      mergeSelectedRegions();
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // 12. Return everything in original article order.
+  // ---------------------------------------------------------------
+
+  selected.sort(
+    (a, b) =>
+      a.start - b.start
+  );
+
+  const result =
+    selected
+      .map((region) =>
+        content
+          .substring(
+            region.start,
+            region.end
+          )
+          .trim()
+      )
+      .filter(Boolean)
+      .join(
+        "\n\n[...relevant content omitted...]\n\n"
+      )
+      .trim();
+
+  if (!result) {
+    return (
+      content.substring(0, maxLength).trim() +
+      "\n...[source truncated]"
+    );
+  }
+
+  return (
+    result +
+    "\n...[source content selected by relevance]"
+  );
 }
-
-
 
 /**
  * Extract readable text from HTML.
  *
- * This is intentionally dependency-free so the plugin does not
- * require another package just for basic page extraction.
+ * Intentionally dependency-free.
  */
- 
-function extractText(html: string): string {
+function extractText(
+  html: string
+): string {
   let text = html;
 
-  // Remove obvious non-content elements.
   text = text
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
-    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg>/gi, " ")
-    .replace(/<template\b[^>]*>[\s\S]*?<\/template>/gi, " ")
-    .replace(/<!--[\s\S]*?-->/g, " ");
+    .replace(
+      /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+      " "
+    )
+    .replace(
+      /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+      " "
+    )
+    .replace(
+      /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+      " "
+    )
+    .replace(
+      /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+      " "
+    )
+    .replace(
+      /<template\b[^>]*>[\s\S]*?<\/template>/gi,
+      " "
+    )
+    .replace(
+      /<!--[\s\S]*?-->/g,
+      " "
+    );
 
-  // Prefer semantic article/main containers.
-  const candidates: string[] = [];
+  const candidates: string[] =
+    [];
 
-  const mainMatches = text.match(
-    /<main\b[^>]*>([\s\S]*?)<\/main>/gi
-  );
+  const mainMatches =
+    text.match(
+      /<main\b[^>]*>([\s\S]*?)<\/main>/gi
+    );
 
-  const articleMatches = text.match(
-    /<article\b[^>]*>([\s\S]*?)<\/article>/gi
-  );
+  const articleMatches =
+    text.match(
+      /<article\b[^>]*>([\s\S]*?)<\/article>/gi
+    );
 
-  if (mainMatches) candidates.push(...mainMatches);
-  if (articleMatches) candidates.push(...articleMatches);
-
-  // If we found semantic content, use the largest block.
-  if (candidates.length > 0) {
-    text = candidates
-      .sort((a, b) => b.length - a.length)[0];
+  if (mainMatches) {
+    candidates.push(
+      ...mainMatches
+    );
   }
 
-  // Remove common navigation / footer / sidebar sections.
+  if (articleMatches) {
+    candidates.push(
+      ...articleMatches
+    );
+  }
+
+  if (
+    candidates.length > 0
+  ) {
+    text = candidates.sort(
+      (a, b) =>
+        b.length - a.length
+    )[0];
+  }
+
   text = text
     .replace(
       /<nav\b[^>]*>[\s\S]*?<\/nav>/gi,
@@ -418,7 +1231,6 @@ function extractText(html: string): string {
       " "
     );
 
-  // Preserve paragraph/heading/list boundaries.
   text = text
     .replace(
       /<\/(?:p|div|section|article|main|h1|h2|h3|h4|h5|h6|li|tr)>/gi,
@@ -429,50 +1241,70 @@ function extractText(html: string): string {
       "\n"
     );
 
-  // Remove remaining HTML tags.
-  text = text.replace(/<[^>]+>/g, " ");
+  text = text.replace(
+    /<[^>]+>/g,
+    " "
+  );
 
-  // Decode common HTML entities.
   text = text
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'");
+    .replace(
+      /&nbsp;/gi,
+      " "
+    )
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&lt;/gi,
+      "<"
+    )
+    .replace(
+      /&gt;/gi,
+      ">"
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    );
 
-  // Normalize whitespace.
   text = text
     .replace(/\r/g, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n[ \t]+/g, "\n")
-    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .replace(
+      /[ \t]+/g,
+      " "
+    )
+    .replace(
+      /[ \t]+\n/g,
+      "\n"
+    )
+    .replace(
+      /\n[ \t]+/g,
+      "\n"
+    )
+    .replace(
+      /\n\s*\n\s*\n+/g,
+      "\n\n"
+    )
     .trim();
 
   return text;
 }
 
 /**
- * Fetch and validate one research candidate.
+ * Validate and fetch a research candidate.
  *
- * Pipeline:
- *
- *   FETCH
- *      ↓
- *   HTTP status check
- *      ↓
- *   4-second wait
- *      ↓
- *   inspect returned page
- *      ↓
- *   ACCEPT / REJECT
+ * The intentional 4-second wait is preserved.
  */
 async function fetchCandidate(
   result: SearXNGResult,
   timeout: number,
   query: string,
-  sourceIndex: number
+  contentLimit: number
 ):
   Promise<
     | {
@@ -493,7 +1325,9 @@ async function fetchCandidate(
 
   try {
     domain =
-      new URL(result.url).hostname;
+      new URL(
+        result.url
+      ).hostname;
   } catch {
     return {
       usable: false,
@@ -507,40 +1341,28 @@ async function fetchCandidate(
 
     const timeoutId =
       setTimeout(
-        () => controller.abort(),
+        () =>
+          controller.abort(),
         timeout
       );
 
-    console.log(
-      `research_web: fetching ${result.url}`
-    );
-
     const response =
-      await fetch(result.url, {
-        method: "GET",
-
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-            "AppleWebKit/537.36 (KHTML, like Gecko) " +
-            "Chrome/131.0 Safari/537.36",
-
-          Accept:
-            "text/html,application/xhtml+xml," +
-            "application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
-        },
-
-        signal: controller.signal,
-      });
+      await fetch(
+        result.url,
+        {
+          method: "GET",
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+          },
+          signal:
+            controller.signal,
+        }
+      );
 
     clearTimeout(timeoutId);
-
-    // -------------------------------------------------------------
-    // HTTP accessibility checks.
-    //
-    // These are much stronger signals than simply finding words
-    // such as "Cloudflare" or "bot" in page content.
-    // -------------------------------------------------------------
 
     if (response.status === 401) {
       return {
@@ -554,7 +1376,7 @@ async function fetchCandidate(
       return {
         usable: false,
         reason:
-          "HTTP 403 Forbidden — page inaccessible",
+          "HTTP 403 Forbidden",
       };
     }
 
@@ -562,7 +1384,7 @@ async function fetchCandidate(
       return {
         usable: false,
         reason:
-          "HTTP 429 Too Many Requests — rate limited",
+          "HTTP 429 Too Many Requests",
       };
     }
 
@@ -570,7 +1392,7 @@ async function fetchCandidate(
       return {
         usable: false,
         reason:
-          `HTTP ${response.status} ${response.statusText} — server error`,
+          `HTTP ${response.status}`,
       };
     }
 
@@ -578,31 +1400,21 @@ async function fetchCandidate(
       return {
         usable: false,
         reason:
-          `HTTP ${response.status} ${response.statusText}`,
+          `HTTP ${response.status}`,
       };
     }
 
-    // -------------------------------------------------------------
-    // The HTTP request succeeded.
-    //
-    // Give the page 4 seconds before inspecting it.
-    // -------------------------------------------------------------
-
-
-	await sleep(4000);
-
-
-    // -------------------------------------------------------------
-    // Read the returned page.
-    // -------------------------------------------------------------
+    // Intentionally preserved.
+    await sleep(PAGE_WAIT_MS);
 
     const html =
       await response.text();
 
-    // Inspect enough of the raw HTML to catch challenge pages.
     const inspectionText =
-      html
-        .substring(0, 100000);
+      html.substring(
+        0,
+        MAX_CHALLENGE_INSPECTION_CHARS
+      );
 
     const challenge =
       detectActiveChallenge(
@@ -617,48 +1429,32 @@ async function fetchCandidate(
       };
     }
 
-    // -------------------------------------------------------------
-    // Extract readable content.
-    // -------------------------------------------------------------
-
     let content =
       extractText(html);
 
-    // A page with almost no content isn't useful research.
-	const wordCount = content
-	  .split(/\s+/)
-	  .filter(Boolean)
-	  .length;
+    const wordCount =
+      content
+        .split(/\s+/)
+        .filter(Boolean)
+        .length;
 
-	if (wordCount < 150) {
-	  return {
-		usable: false,
-		reason:
-		  `insufficient readable page content (${wordCount} words)`,
-	  };
-	}
+    if (
+      wordCount <
+      MIN_PAGE_WORDS
+    ) {
+      return {
+        usable: false,
+        reason:
+          `insufficient readable page content (${wordCount} words)`,
+      };
+    }
 
-	const contentLimits = [
-	  4000,
-	  3000,
-	  2000,
-	  1500,
-	  1500,
-	];
-
-	const contentLimit =
-	  contentLimits[
-		Math.min(
-		  sourceIndex,
-		  contentLimits.length - 1
-		)
-	  ];
-
-	content = selectRelevantContent(
-	  content,
-	  query,
-	  contentLimit
-	);
+    content =
+      selectRelevantContent(
+        content,
+        query,
+        contentLimit
+      );
 
     return {
       usable: true,
@@ -672,17 +1468,167 @@ async function fetchCandidate(
   } catch (error) {
     if (
       error instanceof Error &&
-      error.name === "AbortError"
+      error.name ===
+        "AbortError"
     ) {
       return {
         usable: false,
-        reason:
-          `request timed out after ${timeout}ms`,
+        reason: "request timed out",
       };
     }
 
     return {
       usable: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    };
+  }
+}
+
+/**
+ * Shared page fetcher for fetch_page_content.
+ *
+ * Uses the same important protections as research_web:
+ * - timeout
+ * - HTTP accessibility checks
+ * - intentional challenge detection
+ * - minimum 150-word content requirement
+ * - relevant-content selection
+ */
+async function fetchPage(
+  url: string,
+  timeout: number,
+  query: string,
+  maxLength: number
+): Promise<
+  | {
+      ok: true;
+      content: string;
+    }
+  | {
+      ok: false;
+      reason: string;
+    }
+> {
+  try {
+    const parsedUrl =
+      new URL(url);
+
+    if (
+      parsedUrl.protocol !==
+        "http:" &&
+      parsedUrl.protocol !==
+        "https:"
+    ) {
+      return {
+        ok: false,
+        reason:
+          "unsupported URL protocol",
+      };
+    }
+
+    const controller =
+      new AbortController();
+
+    const timeoutId =
+      setTimeout(
+        () =>
+          controller.abort(),
+        timeout
+      );
+
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (compatible; LM-Studio-Bot/1.0)",
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+          },
+          signal:
+            controller.signal,
+        }
+      );
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return {
+        ok: false,
+        reason:
+          `HTTP ${response.status}`,
+      };
+    }
+
+    const html =
+      await response.text();
+
+    const challenge =
+      detectActiveChallenge(
+        html.substring(
+          0,
+          MAX_CHALLENGE_INSPECTION_CHARS
+        )
+      );
+
+    if (challenge) {
+      return {
+        ok: false,
+        reason:
+          `active verification challenge detected: ${challenge}`,
+      };
+    }
+
+    let content =
+      extractText(html);
+
+    const wordCount =
+      content
+        .split(/\s+/)
+        .filter(Boolean)
+        .length;
+
+    if (
+      wordCount <
+      MIN_PAGE_WORDS
+    ) {
+      return {
+        ok: false,
+        reason:
+          `insufficient readable page content (${wordCount} words)`,
+      };
+    }
+
+    content =
+      selectRelevantContent(
+        content,
+        query,
+        maxLength
+      );
+
+    return {
+      ok: true,
+      content,
+    };
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.name ===
+        "AbortError"
+    ) {
+      return {
+        ok: false,
+        reason: "request timed out",
+      };
+    }
+
+    return {
+      ok: false,
       reason:
         error instanceof Error
           ? error.message
@@ -724,19 +1670,21 @@ export async function toolsProvider(
     name: "search_web",
 
     description:
-	  "Limited web search using local SearXNG. " +
-	  "Returns snippets only and should be used only when full webpage research is unavailable or unnecessary. " +
-	  "For factual, detailed, current, comparative, or research questions, use research_web instead.",
+      "Limited web search using local SearXNG. " +
+      "Returns snippets only and should be used only when full webpage research is unavailable or unnecessary. " +
+      "For factual, detailed, current, comparative, or research questions, use research_web instead.",
 
     parameters: {
       query: z
         .string()
+        .min(1)
         .describe(
           "The search query string"
         ),
 
       num_results: z
         .number()
+        .int()
         .min(1)
         .max(20)
         .optional()
@@ -745,23 +1693,40 @@ export async function toolsProvider(
         ),
 
       time_range: z
-        .string()
+        .enum([
+          "day",
+          "week",
+          "month",
+          "year",
+        ])
         .optional()
         .describe(
-          "Optional time filter: 'day', 'week', 'month', or 'year'"
+          "Optional time filter: day, week, month, or year"
+        ),
+
+      page: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe(
+          "SearXNG result page. Default: 1."
         ),
     },
 
     implementation: async (params: {
       query: string;
       num_results?: number;
-      time_range?: string;
+      time_range?: TimeRange;
+      page?: number;
     }) => {
       try {
         const {
           query,
           num_results,
           time_range,
+          page = 1,
         } = params;
 
         const pageSize =
@@ -776,68 +1741,54 @@ export async function toolsProvider(
             safesearch: "0",
           });
 
-		const normalizedTimeRange =
-		  time_range?.toLowerCase().trim();
+        const normalizedTimeRange =
+          normalizeTimeRange(
+            time_range
+          );
 
-		if (normalizedTimeRange) {
-		  const validRanges = [
-			"day",
-			"week",
-			"month",
-			"year",
-		  ];
-
-		  if (
-			validRanges.includes(
-			  normalizedTimeRange
-			)
-		  ) {
-			searchParams.append(
-			  "time_range",
-			  normalizedTimeRange
-			);
-		  }
-		}
+        if (
+          normalizedTimeRange
+        ) {
+          searchParams.append(
+            "time_range",
+            normalizedTimeRange
+          );
+        }
 
         const searchUrl =
           `${searxngUrl}/search?${searchParams.toString()}`;
-
-        console.log(
-          `Querying SearXNG: ${searchUrl.replace(
-            /format=json/,
-            "format=..."
-          )}`
-        );
 
         const controller =
           new AbortController();
 
         const timeoutId =
           setTimeout(
-            () => controller.abort(),
+            () =>
+              controller.abort(),
             timeout
           );
 
         const response =
-          await fetch(searchUrl, {
-            method: "GET",
-
-            headers: {
-              Accept:
-                "application/json",
-              "User-Agent":
-                "LM-Studio-Plugin/1.0",
-            },
-
-            signal: controller.signal,
-          });
+          await fetch(
+            searchUrl,
+            {
+              method: "GET",
+              headers: {
+                Accept:
+                  "application/json",
+                "User-Agent":
+                  "LM-Studio-Plugin/1.0",
+              },
+              signal:
+                controller.signal,
+            }
+          );
 
         clearTimeout(timeoutId);
 
         if (!response.ok) {
           throw new Error(
-            `SearXNG returned status ${response.status}: ` +
-            `${response.statusText}`
+            `SearXNG returned status ${response.status}`
           );
         }
 
@@ -855,14 +1806,18 @@ export async function toolsProvider(
           data.results
             .slice(0, pageSize)
             .map(
-              (result, index) =>
+              (
+                result,
+                index
+              ) =>
                 `[${index + 1}] ${result.title}\n` +
                 `URL: ${result.url}\n` +
                 `Snippet: ${result.content.substring(
                   0,
                   300
                 )}${
-                  result.content.length > 300
+                  result.content.length >
+                  300
                     ? "..."
                     : ""
                 }\n` +
@@ -883,18 +1838,16 @@ export async function toolsProvider(
       } catch (error) {
         if (
           error instanceof Error &&
-          error.name === "AbortError"
+          error.name ===
+            "AbortError"
         ) {
           return (
-            `Error: SearXNG request timed out after ` +
-            `${timeout}ms. Check that SearXNG is running at ` +
-            `${searxngUrl}.`
+            `Error: SearXNG request timed out after ${timeout}ms.`
           );
         }
 
         return (
-          `Error searching SearXNG: ` +
-          `${
+          `Error searching SearXNG: ${
             error instanceof Error
               ? error.message
               : String(error)
@@ -912,7 +1865,9 @@ export async function toolsProvider(
     name: "fetch_page_content",
 
     description:
-      "Fetch and extract text content from a specific URL.",
+      "Fetch and extract useful readable content from a specific URL. " +
+      "Rejects inaccessible pages, active verification challenges, " +
+      "and pages with fewer than 150 readable words.",
 
     parameters: {
       url: z
@@ -922,75 +1877,56 @@ export async function toolsProvider(
           "The URL to fetch"
         ),
 
+      query: z
+        .string()
+        .min(1)
+        .describe(
+          "The question or topic used to select the most relevant parts of the page"
+        ),
+
       max_length: z
         .number()
+        .int()
         .min(100)
         .max(10000)
         .optional()
         .describe(
-          "Maximum characters to return. Default: 2000."
+          "Maximum characters to return. Default: 3000."
         ),
     },
 
     implementation: async (params: {
       url: string;
+      query: string;
       max_length?: number;
     }) => {
-      try {
-        const {
+      const {
+        url,
+        query,
+        max_length,
+      } = params;
+
+      const maxLength =
+        max_length ?? 3000;
+
+      const result =
+        await fetchPage(
           url,
-          max_length,
-        } = params;
-
-        const maxLength =
-          max_length ?? 2000;
-
-        const response =
-          await fetch(url, {
-            headers: {
-              "User-Agent":
-                "Mozilla/5.0 (compatible; LM-Studio-Bot/1.0)",
-            },
-          });
-
-        if (!response.ok) {
-          return (
-            `Failed to fetch ${url}: ` +
-            `${response.status} ${response.statusText}`
-          );
-        }
-
-        const html =
-          await response.text();
-
-        let text =
-          extractText(html);
-
-        if (
-          text.length >
+          timeout,
+          query,
           maxLength
-        ) {
-          text =
-            text.substring(
-              0,
-              maxLength
-            ) +
-            "... [truncated]";
-        }
-
-        return (
-          `Content from ${url}:\n\n${text}`
         );
-      } catch (error) {
+
+      if (!result.ok) {
         return (
-          `Error fetching page: ` +
-          `${
-            error instanceof Error
-              ? error.message
-              : String(error)
-          }`
+          `Unable to use ${url}: ${result.reason}`
         );
       }
+
+      return (
+        `Content from ${url}:\n\n` +
+        result.content
+      );
     },
   });
 
@@ -1002,29 +1938,27 @@ export async function toolsProvider(
     name: "research_web",
 
     description:
-		"Primary web research tool using local SearXNG. " +
-		"Use for factual, detailed, current, comparative, or research questions. " +
-		"Fetches and reads actual webpages, not snippets, and collects up to 5 usable sources. " +
-		"Rejects inaccessible pages and active verification challenges. " +
-		"Compare multiple sources and answer from the returned SOURCE content. " +
-		"For all factual claims, include a Markdown link to its supporting SOURCE " +
-		"immediately after the claim. Use the SOURCE title as the link text, including the article's date if available. " +
-		"Only link to URLs present in the returned SOURCE list. " +
-		"If no usable webpages are found on page 1, ask whether the user wants " +
-		"the available snippets or the next 15 candidates from page 2. " +
-		"If the user requests the next results, call this tool again with page 2. " +
-		"Do not automatically use snippets unless the user chooses them. " +
-		"Present distinct news stories separately rather than combining them into a single narrative.",
+	 "Primary web research tool using local SearXNG. " +
+	  "Use for factual, current, detailed, comparative, or research questions. " +
+	  "Fetches and reads actual webpages, not search snippets, and returns up to 5 usable sources. " +
+	  "Rejects inaccessible pages, verification challenges, and pages with fewer than 150 readable words. " +
+	  "Avoids duplicate articles while allowing multiple useful sources from the same domain. " +
+	  "Answer from the returned SOURCE content and cite factual claims with the supporting SOURCE link immediately after the claim. " +
+	  "Only use URLs provided by the returned sources. " +
+	  "If no usable pages are found, ask whether to use snippets or continue to the next 15 results. " +
+	  "Present distinct news stories separately.",
 
     parameters: {
       query: z
         .string()
+        .min(1)
         .describe(
           "The topic or question to research"
         ),
 
       sources: z
         .number()
+        .int()
         .min(1)
         .max(5)
         .optional()
@@ -1033,34 +1967,39 @@ export async function toolsProvider(
         ),
 
       time_range: z
-        .string()
+        .enum([
+          "day",
+          "week",
+          "month",
+          "year",
+        ])
         .optional()
         .describe(
-          "Optional freshness filter: 'day', 'week', 'month', or 'year'"
+          "Optional freshness filter: day, week, month, or year"
         ),
-		
-		page: z
-		  .number()
-		  .int()
-		  .min(1)
-		  .optional()
-		  .describe(
-			"SearXNG result page to research. Default: 1."
-		),
-		
+
+      page: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe(
+          "SearXNG result page to research. Default: 1."
+        ),
     },
 
     implementation: async (params: {
       query: string;
       sources?: number;
-      time_range?: string;
-	  page?: number;
+      time_range?: TimeRange;
+      page?: number;
     }) => {
       const {
         query,
         sources,
         time_range,
-		page = 1,
+        page = 1,
       } = params;
 
       const targetSources =
@@ -1068,10 +2007,6 @@ export async function toolsProvider(
         DEFAULT_RESEARCH_SOURCES;
 
       try {
-        // ----------------------------------------------------------
-        // STEP 1: Ask SearXNG for 10 candidates.
-        // ----------------------------------------------------------
-
         const searchParams =
           new URLSearchParams({
             q: query,
@@ -1080,55 +2015,48 @@ export async function toolsProvider(
             safesearch: "0",
           });
 
-        if (time_range) {
-          const validRanges = [
-            "day",
-            "week",
-            "month",
-            "year",
-          ];
+        const normalizedTimeRange =
+          normalizeTimeRange(
+            time_range
+          );
 
-          if (
-            validRanges.includes(
-              time_range
-            )
-          ) {
-            searchParams.append(
-              "time_range",
-              time_range
-            );
-          }
+        if (
+          normalizedTimeRange
+        ) {
+          searchParams.append(
+            "time_range",
+            normalizedTimeRange
+          );
         }
 
         const searchUrl =
           `${searxngUrl}/search?${searchParams.toString()}`;
-
-        console.log(
-          `research_web: searching for "${query}"`
-        );
 
         const controller =
           new AbortController();
 
         const timeoutId =
           setTimeout(
-            () => controller.abort(),
+            () =>
+              controller.abort(),
             timeout
           );
 
         const searchResponse =
-          await fetch(searchUrl, {
-            method: "GET",
-
-            headers: {
-              Accept:
-                "application/json",
-              "User-Agent":
-                "LM-Studio-Plugin/1.0",
-            },
-
-            signal: controller.signal,
-          });
+          await fetch(
+            searchUrl,
+            {
+              method: "GET",
+              headers: {
+                Accept:
+                  "application/json",
+                "User-Agent":
+                  "LM-Studio-Plugin/1.0",
+              },
+              signal:
+                controller.signal,
+            }
+          );
 
         clearTimeout(timeoutId);
 
@@ -1136,8 +2064,7 @@ export async function toolsProvider(
           !searchResponse.ok
         ) {
           throw new Error(
-            `SearXNG returned ${searchResponse.status}: ` +
-            `${searchResponse.statusText}`
+            `SearXNG returned ${searchResponse.status}`
           );
         }
 
@@ -1159,22 +2086,11 @@ export async function toolsProvider(
             RESEARCH_CANDIDATES
           );
 
-        console.log(
-          `research_web: received ${candidates.length} candidates`
-        );
-
-        // ----------------------------------------------------------
-        // STEP 2: Check candidates sequentially.
-        // ----------------------------------------------------------
-
         const accepted: AcceptedSource[] =
           [];
 
         const rejected: RejectedSource[] =
           [];
-
-        const seenDomains =
-          new Set<string>();
 
         let candidateIndex = 0;
 
@@ -1211,10 +2127,13 @@ export async function toolsProvider(
             continue;
           }
 
-          // Keep the source set diverse.
+          // Unlike the previous implementation, do not reject
+          // another result simply because it comes from the same
+          // domain. Only reject obvious duplicate articles.
           if (
-            seenDomains.has(
-              domain
+            isDuplicateArticle(
+              candidate,
+              accepted
             )
           ) {
             rejected.push({
@@ -1223,32 +2142,30 @@ export async function toolsProvider(
               url:
                 candidate.url,
               reason:
-                "duplicate domain",
+                "duplicate article",
             });
 
             continue;
           }
 
-          console.log(
-            `research_web: checking candidate ` +
-            `${candidateIndex}/${candidates.length}: ` +
-            `${candidate.url}`
-          );
+          const contentLimit =
+            RESEARCH_CONTENT_LIMITS[
+              Math.min(
+                accepted.length,
+                RESEARCH_CONTENT_LIMITS.length -
+                  1
+              )
+            ];
 
           const result =
             await fetchCandidate(
               candidate,
               timeout,
-			  query,
-			  accepted.length
+              query,
+              contentLimit
             );
 
           if (!result.usable) {
-            console.log(
-              `research_web: REJECTED — ` +
-              `${candidate.url} — ${result.reason}`
-            );
-
             rejected.push({
               title:
                 candidate.title,
@@ -1258,94 +2175,96 @@ export async function toolsProvider(
                 result.reason,
             });
 
-            // Candidate is discarded.
-            // Move directly to the next SearXNG result.
             continue;
           }
 
-          // --------------------------------------------------------
-          // ACCEPTED SOURCE.
-          // --------------------------------------------------------
+          accepted.push({
+            title:
+              result.title,
+            url:
+              result.url,
+            domain:
+              result.domain,
+            engine:
+              result.engine,
+            score:
+              result.score,
+            contentSource:
+              "FETCHED_PAGE",
+            content:
+              result.content,
+          });
+        }
 
-          seenDomains.add(
-            domain
-          );
+        if (
+          accepted.length === 0
+        ) {
+          const snippetResults =
+            candidates
+              .map(
+                (
+                  candidate,
+                  index
+                ) =>
+                  `[${index + 1}] ${candidate.title}\n` +
+                  `URL: ${candidate.url}\n` +
+                  `Snippet: ${candidate.content.substring(
+                    0,
+                    500
+                  )}`
+              )
+              .join(
+                "\n\n"
+              );
 
-			accepted.push({
-			  title: result.title,
-			  url: result.url,
-			  domain: result.domain,
-			  engine: result.engine,
-			  score: result.score,
-			  contentSource: "FETCHED_PAGE",
-			  content: result.content,
-			});
-
-          console.log(
-            `research_web: ACCEPTED ` +
-            `${accepted.length}/${targetSources}: ` +
-            `${result.url}`
+          return (
+            `I couldn't access any of the current ${candidateIndex} candidate webpages for "${query}".\n\n` +
+            `Would you like me to use the available search snippets, ` +
+            `or attempt the next 15 search results?\n\n` +
+            `AVAILABLE SNIPPETS:\n\n` +
+            snippetResults
           );
         }
 
-        // ----------------------------------------------------------
-        // STEP 3: Return research package.
-        // ----------------------------------------------------------
+		let output =
+		  `RESEARCH RESULTS\n` +
+		  `Query: ${query}\n` +
+		  `Usable sources: ${accepted.length}/${targetSources}\n` +
+		  `Candidates checked: ${candidateIndex}\n\n` +
+			`SOURCE USAGE INSTRUCTIONS:\n` +
+			`Answer from the SOURCE content below. ` +
+			`Immediately cite factual claims with the supporting SOURCE ID. ` +
+			`Use only the provided source URLs.\n\n`;
 
-		if (accepted.length === 0) {
-		  const snippetResults = candidates
-			.map(
-			  (candidate, index) =>
-				`[${index + 1}] ${candidate.title}\n` +
-				`URL: ${candidate.url}\n` +
-				`Snippet: ${candidate.content.substring(0, 500)}`
-			)
-			.join("\n\n");
-
-		  return (
-			`I couldn't access any of the current ` +
-			`${candidateIndex} candidate webpages for "${query}".\n\n` +
-			`Would you like me to use the available search snippets, ` +
-			`or attempt the next 15 search results?\n\n` +
-			`AVAILABLE SNIPPETS:\n\n` +
-			snippetResults
-		  );
-		}
-
-        let output =
-          `RESEARCH RESULTS\n` +
-          `Query: ${query}\n` +
-          `Usable sources: ${accepted.length}/${targetSources}\n` +
-          `Candidates checked: ${candidateIndex}\n\n` +
-          `Only sources listed under SOURCE 1 through ` +
-          `SOURCE ${accepted.length} were accepted and supplied ` +
-          `as research material.\n\n`;
-
-        accepted.forEach(
-          (source, index) => {
-            output +=
-              `SOURCE ${index + 1}\n` +
-              `Title: ${source.title}\n` +
-              `URL: ${source.url}\n` +
-              `${source.content}\n\n`;
-          }
-        );
+		accepted.forEach(
+		  (
+			source,
+			index
+		  ) => {
+			output +=
+			  `SOURCE ${index + 1}\n` +
+			  `Title: ${source.title}\n` +
+			  `URL: ${source.url}\n` +
+			  `SOURCE ID: [SOURCE ${index + 1}]\n` +
+			  `CONTENT:\n` +
+			  `${source.content}\n\n`;
+		  }
+		);
 
         return output;
       } catch (error) {
         if (
           error instanceof Error &&
-          error.name === "AbortError"
+          error.name ===
+            "AbortError"
         ) {
           return (
-            `Research request timed out after ` +
-            `${timeout}ms. Check SearXNG at ${searxngUrl}.`
+            `Research request timed out after ${timeout}ms.`
           );
         }
 
         return (
-          `Error researching "${query}": ` +
-          `${
+          `Error researching "${query}": ${
             error instanceof Error
               ? error.message
               : String(error)
